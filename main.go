@@ -40,6 +40,8 @@ func main() {
 			channel.POST("/follow", channelHandler.FollowChannel)
 			channel.POST("/unfollow", channelHandler.UnfollowChannel)
 			channel.GET("/channel_list", channelHandler.GetChannelList)
+			channel.GET("/channel_content", channelHandler.GetChannelContent)
+			channel.GET("/channel_ws", channelHandler.ChannelWSHandler)
 		}
 	}
 

@@ -5,6 +5,8 @@ import (
 	"database/sql"
 	"encoding/json"
 	"fmt"
+	"log"
+	"strings"
 	"time"
 
 	_ "github.com/go-sql-driver/mysql"
@@ -332,4 +334,302 @@ func (db *Database) IsFollowing(userID int, channelID string) (bool, error) {
 		return false, fmt.Errorf("failed to check follow status: %v", err)
 	}
 	return count > 0, nil
+}
+
+// GetTwitterInfoByTypeAndCA gets Twitter info by type and CA address
+func (db *Database) GetTwitterInfoByTypeAndCA(type_ int, caAddresses []string, limit, offset int) ([]models.TwitterInfo, error) {
+	var twitterInfos []models.TwitterInfo
+	var query string
+	var args []interface{}
+
+	query = "SELECT id, twitterId, content, chainId, address, createTime, type FROM twitter_info WHERE type = ?"
+	args = append(args, type_)
+
+	if len(caAddresses) > 0 {
+		placeholders := make([]string, len(caAddresses))
+		for i := range caAddresses {
+			placeholders[i] = "?"
+			args = append(args, caAddresses[i])
+		}
+		query += " AND address IN (" + strings.Join(placeholders, ",") + ")"
+	}
+
+	query += " ORDER BY createTime DESC LIMIT ? OFFSET ?"
+	args = append(args, limit, offset)
+
+	rows, err := db.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info models.TwitterInfo
+		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
+		if err != nil {
+			return nil, err
+		}
+		twitterInfos = append(twitterInfos, info)
+	}
+
+	return twitterInfos, nil
+}
+
+// GetTwitterInfoByType gets Twitter info by type only
+func (db *Database) GetTwitterInfoByType(type_ int, limit, offset int) ([]models.TwitterInfo, error) {
+	var twitterInfos []models.TwitterInfo
+
+	query := "SELECT id, twitterId, content, chainId, address, createTime, type FROM twitter_info WHERE type = ? ORDER BY createTime DESC LIMIT ? OFFSET ?"
+	rows, err := db.db.Query(query, type_, limit, offset)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info models.TwitterInfo
+		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
+		if err != nil {
+			return nil, err
+		}
+		twitterInfos = append(twitterInfos, info)
+	}
+
+	return twitterInfos, nil
+}
+
+// GetTwitterInfoByWatchlist gets Twitter info based on watchlist conditions
+func (db *Database) GetTwitterInfoByWatchlist(conditions []string, contentType, limit, offset int) ([]models.TwitterInfo, error) {
+	var twitterInfos []models.TwitterInfo
+	if len(conditions) == 0 {
+		return twitterInfos, nil
+	}
+
+	query := "SELECT * FROM twitter_info WHERE (" + strings.Join(conditions, " OR ") + ") AND type = ? ORDER BY createTime DESC"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+	}
+	log.Print(query)
+	rows, err := db.db.Query(query, contentType)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info models.TwitterInfo
+		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
+		if err != nil {
+			return nil, err
+		}
+		twitterInfos = append(twitterInfos, info)
+	}
+
+	return twitterInfos, nil
+}
+
+// GetTwitterInfoByProfileAndFollow gets Twitter info for profile updates and follows
+func (db *Database) GetTwitterInfoByProfileAndFollow(twitterIds []string, contentType, limit, offset int) ([]models.TwitterInfo, error) {
+	var twitterInfos []models.TwitterInfo
+
+	if len(twitterIds) == 0 {
+		return twitterInfos, nil
+	}
+
+	query := "SELECT * FROM twitter_info WHERE twitterId IN ("
+	placeholders := make([]string, len(twitterIds))
+	args := make([]interface{}, len(twitterIds))
+	for i, id := range twitterIds {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+	query += strings.Join(placeholders, ",") + ")"
+
+	query += " AND type = ? ORDER BY createTime DESC"
+	args = append(args, contentType)
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+	}
+
+	rows, err := db.db.Query(query, args...)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var info models.TwitterInfo
+		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
+		if err != nil {
+			return nil, err
+		}
+		twitterInfos = append(twitterInfos, info)
+	}
+
+	return twitterInfos, nil
+}
+
+// GetFollowedChannels gets all channels followed by a user
+func (db *Database) GetFollowedChannels(userID int) ([]*models.Follow, error) {
+	var follows []*models.Follow
+	rows, err := db.db.Query("SELECT * FROM follows WHERE userId = ?", userID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var follow models.Follow
+		err := rows.Scan(&follow.ID, &follow.UserID, &follow.ChannelID, &follow.CreatedAt)
+		if err != nil {
+			return nil, err
+		}
+		follows = append(follows, &follow)
+	}
+
+	return follows, nil
+}
+
+// GetChannelByID gets a channel by its ID
+func (db *Database) GetChannelByID(channelID string) (*models.Channel, error) {
+	var channel models.Channel
+	row := db.db.QueryRow("SELECT * FROM channels WHERE id = ?", channelID)
+
+	err := row.Scan(
+		&channel.ID,
+		&channel.OwnerID,
+		&channel.IsVerified,
+		&channel.Name,
+		&channel.Description,
+		&channel.Avatar,
+		&channel.ChatLink,
+		&channel.IsPublic,
+		&channel.IsHot,
+		&channel.HotExpireAt,
+		&channel.CreatedAt,
+		&channel.UpdatedAt,
+		&channel.Watchlist,
+		&channel.Eventlist,
+		&channel.FollowerCount,
+		&channel.RecentFollowers,
+	)
+	if err != nil {
+		return nil, err
+	}
+	return &channel, nil
+}
+
+// GetAllChannels gets all channels with pagination
+func (db *Database) GetAllChannels(limit, offset int) ([]*models.Channel, error) {
+	var channels []*models.Channel
+	query := "SELECT * FROM channels"
+	if limit > 0 {
+		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
+	}
+
+	rows, err := db.db.Query(query)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+
+	for rows.Next() {
+		var channel models.Channel
+		err := rows.Scan(
+			&channel.ID,
+			&channel.OwnerID,
+			&channel.IsVerified,
+			&channel.Name,
+			&channel.Description,
+			&channel.Avatar,
+			&channel.ChatLink,
+			&channel.IsPublic,
+			&channel.IsHot,
+			&channel.HotExpireAt,
+			&channel.CreatedAt,
+			&channel.UpdatedAt,
+			&channel.Watchlist,
+			&channel.Eventlist,
+			&channel.FollowerCount,
+			&channel.RecentFollowers,
+		)
+		if err != nil {
+			return nil, err
+		}
+		channels = append(channels, &channel)
+	}
+
+	return channels, nil
+}
+
+// GetChannelByIDs gets multiple channels by their IDs in a single query
+func (db *Database) GetChannelByIDs(channelIDs []string) ([]*models.Channel, error) {
+	if len(channelIDs) == 0 {
+		return nil, nil
+	}
+
+	// Build the query with placeholders
+	placeholders := make([]string, len(channelIDs))
+	args := make([]interface{}, len(channelIDs))
+	for i, id := range channelIDs {
+		placeholders[i] = "?"
+		args[i] = id
+	}
+
+	query := "SELECT * FROM channels WHERE id IN (" + strings.Join(placeholders, ",") + ")"
+	rows, err := db.db.Query(query, args...)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query channels: %v", err)
+	}
+	defer rows.Close()
+
+	var channels []*models.Channel
+	for rows.Next() {
+		channel := &models.Channel{}
+		var watchlistStr, eventlistStr, recentFollowersStr string
+		err := rows.Scan(
+			&channel.ID,
+			&channel.OwnerID,
+			&channel.IsVerified,
+			&channel.Name,
+			&channel.Description,
+			&channel.Avatar,
+			&channel.ChatLink,
+			&channel.IsPublic,
+			&channel.IsHot,
+			&channel.HotExpireAt,
+			&channel.CreatedAt,
+			&channel.UpdatedAt,
+			&watchlistStr,
+			&eventlistStr,
+			&channel.FollowerCount,
+			&recentFollowersStr,
+		)
+		if err != nil {
+			return nil, fmt.Errorf("failed to scan channel: %v", err)
+		}
+
+		// Unmarshal Watchlist
+		if err := json.Unmarshal([]byte(watchlistStr), &channel.Watchlist); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal watchlist: %v", err)
+		}
+
+		// Unmarshal Eventlist
+		if err := json.Unmarshal([]byte(eventlistStr), &channel.Eventlist); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal eventlist: %v", err)
+		}
+
+		// Unmarshal RecentFollowers
+		if err := json.Unmarshal([]byte(recentFollowersStr), &channel.RecentFollowers); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal recentFollowers: %v", err)
+		}
+
+		channels = append(channels, channel)
+	}
+
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating rows: %v", err)
+	}
+
+	return channels, nil
 }

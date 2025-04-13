@@ -167,8 +167,6 @@ type ChannelListRequest struct {
 	Limit  int    `form:"limit"`
 }
 
-// ChannelDetailRequest represents the request to get channel detail
-
 // APIResponse represents the common API response format
 type APIResponse struct {
 	Success bool        `json:"success"`
@@ -190,9 +188,22 @@ type Follow struct {
 	CreatedAt int64  `json:"createdAt"`
 }
 
-type ChannelDetailRequest struct {
-	ChannelID string `json:"channelId" binding:"required"`
-	Limit     int    `json:"limit"`
-	Offset    int    `json:"offset"`
-	Type      string `json:"type" binding:"required"`
+// TwitterInfo represents a Twitter information record
+type TwitterInfo struct {
+	ID         int    `json:"id" gorm:"primaryKey;autoIncrement"`
+	TwitterId  string `json:"twitterId" gorm:"not null"`
+	Content    string `json:"content" gorm:"type:longtext"`
+	ChainId    string `json:"chainId"`
+	Address    string `json:"address"`
+	CreateTime int64  `json:"createTime"`
+	Type       int    `json:"type" gorm:"not null"`
+}
+
+// ChannelContentRequest represents the request to get channel content
+type ChannelContentRequest struct {
+	ChannelID   string `form:"channelId" binding:"required"`
+	Limit       int    `form:"limit"`
+	Offset      int    `form:"offset"`
+	Type        string `form:"type"`
+	ContentType int    `form:"contentType" binding:"required"`
 }
