@@ -42,6 +42,7 @@ func main() {
 			channel.GET("/channel_list", channelHandler.GetChannelList)
 			channel.GET("/channel_content", channelHandler.GetChannelContent)
 			channel.GET("/channel_ws", channelHandler.ChannelWSHandler)
+			channel.GET("/twitter_info", channelHandler.TwitterInfo)
 		}
 	}
 

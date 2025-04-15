@@ -4,10 +4,10 @@ import (
 	"TwitterMonitor/internal/database"
 	"TwitterMonitor/internal/models"
 	"TwitterMonitor/internal/utils"
+	"encoding/json"
 	"fmt"
 	"log"
 	"net/http"
-	"time"
 
 	"github.com/gin-gonic/gin"
 	"github.com/google/uuid"
@@ -75,7 +75,7 @@ func (h *ChannelHandler) CreateChannel(c *gin.Context) {
 		Name:            req.Name,
 		Description:     req.Description,
 		Avatar:          req.Avatar,
-		ChatLink:        req.TwitterLink,
+		ChatLink:        req.ChatLink,
 		IsPublic:        req.IsPublic,
 		IsHot:           false,
 		HotExpireAt:     "",
@@ -137,6 +137,14 @@ func (h *ChannelHandler) UpdateChannel(c *gin.Context) {
 		return
 	}
 
+	if userID != channels[0].OwnerID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"code":    403,
+			"message": "User not permitted to change channel",
+		})
+		return
+	}
+
 	// Get the existing channel
 	existingChannel := channels[0]
 
@@ -150,8 +158,8 @@ func (h *ChannelHandler) UpdateChannel(c *gin.Context) {
 	if req.Avatar != "" {
 		existingChannel.Avatar = req.Avatar
 	}
-	if req.TwitterLink != "" {
-		existingChannel.ChatLink = req.TwitterLink
+	if req.ChatLink != "" {
+		existingChannel.ChatLink = req.ChatLink
 	}
 	if req.Watchlist != nil {
 		existingChannel.Watchlist = req.Watchlist
@@ -209,6 +217,14 @@ func (h *ChannelHandler) DeleteChannel(c *gin.Context) {
 		c.JSON(http.StatusInternalServerError, gin.H{
 			"code":    500,
 			"message": "Failed to check channel ownership",
+		})
+		return
+	}
+
+	if req.UserID != channels[0].OwnerID {
+		c.JSON(http.StatusForbidden, gin.H{
+			"code":    403,
+			"message": "User not permitted to change channel",
 		})
 		return
 	}
@@ -514,20 +530,15 @@ func (h *ChannelHandler) GetChannelList(c *gin.Context) {
 	var responseChannels []struct {
 		Meta            models.ChannelMeta `json:"meta"`
 		Owner           models.Owner       `json:"owner"`
-		RecentFollowers []string           `json:"recentFollowers"`
+		RecentFollowers []int              `json:"recentFollowers"`
 	}
 
 	for _, channel := range paginatedChannels {
-		// Convert RecentFollowers from []int to []string
-		recentFollowers := make([]string, len(channel.RecentFollowers))
-		for i, follower := range channel.RecentFollowers {
-			recentFollowers[i] = fmt.Sprintf("%d", follower)
-		}
 
 		responseChannels = append(responseChannels, struct {
 			Meta            models.ChannelMeta `json:"meta"`
 			Owner           models.Owner       `json:"owner"`
-			RecentFollowers []string           `json:"recentFollowers"`
+			RecentFollowers []int              `json:"recentFollowers"`
 		}{
 			Meta: models.ChannelMeta{
 				Avatar:        channel.Avatar,
@@ -550,7 +561,7 @@ func (h *ChannelHandler) GetChannelList(c *gin.Context) {
 				UserID:   channel.OwnerID,
 				UserName: "", // Generate a default username
 			},
-			RecentFollowers: recentFollowers,
+			RecentFollowers: channel.RecentFollowers,
 		})
 	}
 
@@ -561,6 +572,45 @@ func (h *ChannelHandler) GetChannelList(c *gin.Context) {
 			"total":    total,
 		},
 	})
+}
+
+// fetchMarketInfo fetches market info for a given chain ID and token CA
+func fetchMarketInfo(chainId, tokenCa string) (interface{}, error) {
+	if chainId == "" || tokenCa == "" {
+		return nil, nil
+	}
+
+	url := fmt.Sprintf("https://api.litrocket.io/v1/market/market_info?chain_id=%s&token_ca=%s", chainId, tokenCa)
+	log.Println(url)
+	req, err := http.NewRequest("GET", url, nil)
+	if err != nil {
+		return nil, err
+	}
+
+	// Add required headers
+	req.Header.Set("X-Language", "zh")
+	req.Header.Set("X-Source", "ios")
+	req.Header.Set("Qlbl69aq2dxo4t", "1")
+
+	client := &http.Client{}
+	resp, err := client.Do(req)
+	if err != nil {
+		return nil, err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusOK {
+		return nil, fmt.Errorf("API request failed with status: %d", resp.StatusCode)
+	}
+
+	var result struct {
+		Data interface{} `json:"data"`
+	}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		return nil, err
+	}
+
+	return result.Data, nil
 }
 
 func (h *ChannelHandler) GetChannelContent(c *gin.Context) {
@@ -609,7 +659,7 @@ func (h *ChannelHandler) GetChannelContent(c *gin.Context) {
 	}
 
 	channel := channels[0]
-	var twitterInfos []models.TwitterInfo
+	var twitterInfos []*models.TwitterInfo
 
 	if req.ContentType == 1 {
 		// Build conditions for tweets
@@ -629,6 +679,7 @@ func (h *ChannelHandler) GetChannelContent(c *gin.Context) {
 
 		twitterInfos, err = h.db.GetTwitterInfoByWatchlist(conditions, req.ContentType, req.Limit, req.Offset)
 		if err != nil {
+			utils.LogError("Failed to get Twitter info: %v", err)
 			c.JSON(http.StatusInternalServerError, models.APIResponse{
 				Success: false,
 				Error: &models.APIError{
@@ -660,194 +711,73 @@ func (h *ChannelHandler) GetChannelContent(c *gin.Context) {
 		}
 	}
 
+	// Get market info for each Twitter info
+	marketInfos := make([]interface{}, len(twitterInfos))
+	for i, info := range twitterInfos {
+		marketInfo, err := fetchMarketInfo(info.ChainId, info.Address)
+
+		if err != nil {
+			utils.LogError("Failed to fetch market info: %v", err)
+			marketInfos[i] = nil
+			continue
+		}
+		marketInfos[i] = marketInfo
+	}
+
 	// Return combined response
 	c.JSON(http.StatusOK, models.APIResponse{
 		Success: true,
 		Data: map[string]interface{}{
-			//"channel": channel,
 			"twitter": twitterInfos,
+			"market":  marketInfos,
+			"total":   len(channels),
 		},
 	})
 }
 
-// ChannelWSHandler handles WebSocket connections for channel list updates
-func (h *ChannelHandler) ChannelWSHandler(c *gin.Context) {
-	// Upgrade HTTP connection to WebSocket
-	conn, err := upgrader.Upgrade(c.Writer, c.Request, nil)
-	if err != nil {
-		utils.LogError("Failed to upgrade connection: %v", err)
+func (h *ChannelHandler) TwitterInfo(c *gin.Context) {
+	user := c.Query("user")
+	if user == "" {
+		c.JSON(http.StatusBadRequest, models.APIResponse{
+			Success: false,
+			Error: &models.APIError{
+				Code:    "400",
+				Message: "user parameter is required",
+			},
+		})
 		return
 	}
-	defer conn.Close()
 
-	// Create a ticker for 1-second intervals
-	ticker := time.NewTicker(1 * time.Second)
-	defer ticker.Stop()
-
-	// Create a done channel to handle client disconnection
-	done := make(chan struct{})
-
-	// Handle client disconnection
-	go func() {
-		defer close(done)
-		for {
-			_, _, err := conn.ReadMessage()
-			if err != nil {
-				return
-			}
-		}
-	}()
-
-	// Main loop for sending updates
-	for {
-		select {
-		case <-done:
-			return
-		case <-ticker.C:
-			// Get channel list
-			var req models.ChannelListRequest
-			if err := c.ShouldBindQuery(&req); err != nil {
-				// Send error response
-				errMsg := models.APIResponse{
-					Success: false,
-					Error: &models.APIError{
-						Code:    "400",
-						Message: "Invalid request format: " + err.Error(),
-					},
-				}
-				if err := conn.WriteJSON(errMsg); err != nil {
-					return
-				}
-				continue
-			}
-
-			// Set default values for limit and offset
-			if req.Limit <= 0 {
-				req.Limit = 50
-			}
-			if req.Offset < 0 {
-				req.Offset = 0
-			}
-
-			var channels []*models.Channel
-			var err error
-
-			switch req.Type {
-			case "1":
-				// Get channels by owner ID
-				channels, err = h.db.GetChannelsByOwnerID(req.UserID)
-			case "2":
-				// Get followed channels
-				follows, err := h.db.GetFollowedChannels(req.UserID)
-				if err != nil {
-					errMsg := models.APIResponse{
-						Success: false,
-						Error: &models.APIError{
-							Code:    "500",
-							Message: "Failed to get followed channels",
-						},
-					}
-					if err := conn.WriteJSON(errMsg); err != nil {
-						return
-					}
-					continue
-				}
-
-				// Collect channel IDs
-				var channelIDs []string
-				for _, follow := range follows {
-					channelIDs = append(channelIDs, follow.ChannelID)
-				}
-
-				// Get all channels in a single query
-				channels, err = h.db.GetChannelByIDs(channelIDs)
-			default:
-				// Get all channels
-				channels, err = h.db.GetAllChannels(req.Limit, req.Offset)
-			}
-
-			if err != nil {
-				errMsg := models.APIResponse{
-					Success: false,
-					Error: &models.APIError{
-						Code:    "500",
-						Message: "Failed to get channels",
-					},
-				}
-				if err := conn.WriteJSON(errMsg); err != nil {
-					return
-				}
-				continue
-			}
-
-			// Apply pagination
-			total := len(channels)
-			start := req.Offset
-			end := start + req.Limit
-			if end > total {
-				end = total
-			}
-			if start > total {
-				start = total
-			}
-			paginatedChannels := channels[start:end]
-
-			// Convert channels to response format
-			var responseChannels []struct {
-				Meta            models.ChannelMeta `json:"meta"`
-				Owner           models.Owner       `json:"owner"`
-				RecentFollowers []string           `json:"recentFollowers"`
-			}
-
-			for _, channel := range paginatedChannels {
-				// Convert RecentFollowers from []int to []string
-				recentFollowers := make([]string, len(channel.RecentFollowers))
-				for i, follower := range channel.RecentFollowers {
-					recentFollowers[i] = fmt.Sprintf("%d", follower)
-				}
-
-				responseChannels = append(responseChannels, struct {
-					Meta            models.ChannelMeta `json:"meta"`
-					Owner           models.Owner       `json:"owner"`
-					RecentFollowers []string           `json:"recentFollowers"`
-				}{
-					Meta: models.ChannelMeta{
-						Avatar:        channel.Avatar,
-						ChatLink:      channel.ChatLink,
-						CreatedAt:     fmt.Sprintf("%d", channel.CreatedAt),
-						Description:   channel.Description,
-						IsHot:         channel.IsHot,
-						HotExpireAt:   channel.HotExpireAt,
-						IsVerified:    channel.IsVerified,
-						Eventlist:     channel.Eventlist,
-						FollowerCount: channel.FollowerCount,
-						ID:            channel.ID,
-						Name:          channel.Name,
-						OwnerID:       channel.OwnerID,
-						UpdatedAt:     fmt.Sprintf("%d", channel.UpdatedAt),
-						Watchlist:     channel.Watchlist,
-					},
-					Owner: models.Owner{
-						Email:    "", // These fields should be populated from user service
-						UserID:   channel.OwnerID,
-						UserName: "", // Generate a default username
-					},
-					RecentFollowers: recentFollowers,
-				})
-			}
-
-			// Send response
-			response := models.APIResponse{
-				Success: true,
-				Data: map[string]interface{}{
-					"channels": responseChannels,
-					"total":    total,
-				},
-			}
-
-			if err := conn.WriteJSON(response); err != nil {
-				return
-			}
-		}
+	url := fmt.Sprintf("http://43.160.199.161:5188/tw_user_info?user=%s&token=test0623", user)
+	resp, err := http.Get(url)
+	if err != nil {
+		utils.LogError("Failed to call Twitter info API: %v", err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{
+			Success: false,
+			Error: &models.APIError{
+				Code:    "500",
+				Message: "Failed to fetch Twitter info",
+			},
+		})
+		return
 	}
+	defer resp.Body.Close()
+
+	var result interface{}
+	if err := json.NewDecoder(resp.Body).Decode(&result); err != nil {
+		utils.LogError("Failed to decode response: %v", err)
+		c.JSON(http.StatusInternalServerError, models.APIResponse{
+			Success: false,
+			Error: &models.APIError{
+				Code:    "500",
+				Message: "Failed to parse response",
+			},
+		})
+		return
+	}
+
+	c.JSON(http.StatusOK, models.APIResponse{
+		Success: true,
+		Data:    result,
+	})
 }

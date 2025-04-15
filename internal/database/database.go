@@ -2,10 +2,10 @@ package database
 
 import (
 	"TwitterMonitor/internal/models"
+	"TwitterMonitor/internal/utils"
 	"database/sql"
 	"encoding/json"
 	"fmt"
-	"log"
 	"strings"
 	"time"
 
@@ -35,14 +35,14 @@ func NewDatabase(uri string) (*Database, error) {
 // InsertOrUpdateChannel inserts a channel into the MySQL database or updates it if it already exists
 func (db *Database) InsertOrUpdateChannel(channel *models.Channel) error {
 	now := time.Now().UnixMilli()
-	query := `INSERT INTO channels (id, ownerId, isVerified, name, description, avatar, twitter, isPublic, isHot, hotExpireAt, createdAt, updatedAt, watchlist, eventlist, followerCount, recentFollowers) 
+	query := `INSERT INTO channels (id, ownerId, isVerified, name, description, avatar, chatLink, isPublic, isHot, hotExpireAt, createdAt, updatedAt, watchlist, eventlist, followerCount, recentFollowers) 
 	          VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
 	          ON DUPLICATE KEY UPDATE
 	          isVerified = VALUES(isVerified),
 	          name = VALUES(name),
 	          description = VALUES(description),
 	          avatar = VALUES(avatar),
-	          twitter = VALUES(twitter),
+	          chatLink = VALUES(chatLink),
 	          isPublic = VALUES(isPublic),
 	          isHot = VALUES(isHot),
 	          hotExpireAt = VALUES(hotExpireAt),
@@ -237,17 +237,77 @@ func (db *Database) DeleteChannel(channelID string) error {
 	return nil
 }
 
-// UpdateFollowerCount updates the follower count of a channel
-func (db *Database) UpdateFollowerCount(channelID string, increment bool) error {
+// UpdateFollowerCount updates the follower count and recent followers of a channel
+func (db *Database) UpdateFollowerCount(channelID string, userID int, increment bool) error {
+	// Start transaction
+	tx, err := db.db.Begin()
+	if err != nil {
+		return fmt.Errorf("failed to begin transaction: %v", err)
+	}
+	defer tx.Rollback()
+
+	// Update follower count
 	operator := "-"
 	if increment {
 		operator = "+"
 	}
 	query := fmt.Sprintf("UPDATE channels SET followerCount = CAST(followerCount AS SIGNED) %s 1 WHERE id = ?", operator)
-	_, err := db.db.Exec(query, channelID)
+	_, err = tx.Exec(query, channelID)
 	if err != nil {
 		return fmt.Errorf("failed to update follower count: %v", err)
 	}
+
+	if increment {
+		// Get current recentFollowersStr
+		var currentFollowersStr string
+		err = tx.QueryRow("SELECT recentFollowersStr FROM channels WHERE id = ?", channelID).Scan(&currentFollowersStr)
+		if err != nil {
+			return fmt.Errorf("failed to get current followers: %v", err)
+		}
+
+		// Parse current followers
+		var currentFollowers []int
+		if currentFollowersStr != "" {
+			if err := json.Unmarshal([]byte(currentFollowersStr), &currentFollowers); err != nil {
+				return fmt.Errorf("failed to parse current followers: %v", err)
+			}
+		}
+
+		// Add new follower and ensure uniqueness
+		exists := false
+		for _, id := range currentFollowers {
+			if id == userID {
+				exists = true
+				break
+			}
+		}
+		if !exists {
+			// Add new follower at the beginning
+			currentFollowers = append([]int{userID}, currentFollowers...)
+			// Keep only the most recent 50 followers
+			if len(currentFollowers) > 50 {
+				currentFollowers = currentFollowers[:50]
+			}
+		}
+
+		// Convert back to JSON
+		newFollowersStr, err := json.Marshal(currentFollowers)
+		if err != nil {
+			return fmt.Errorf("failed to marshal followers: %v", err)
+		}
+
+		// Update recentFollowersStr
+		_, err = tx.Exec("UPDATE channels SET recentFollowersStr = ? WHERE id = ?", string(newFollowersStr), channelID)
+		if err != nil {
+			return fmt.Errorf("failed to update recent followers: %v", err)
+		}
+	}
+
+	// Commit transaction
+	if err := tx.Commit(); err != nil {
+		return fmt.Errorf("failed to commit transaction: %v", err)
+	}
+
 	return nil
 }
 
@@ -275,7 +335,7 @@ func (db *Database) FollowChannel(follow *models.Follow) error {
 	}
 
 	// Update follower count
-	if err := db.UpdateFollowerCount(follow.ChannelID, true); err != nil {
+	if err := db.UpdateFollowerCount(follow.ChannelID, follow.UserID, true); err != nil {
 		return err
 	}
 
@@ -313,7 +373,7 @@ func (db *Database) UnfollowChannel(userID int, channelID string) error {
 	}
 
 	// Update follower count
-	if err := db.UpdateFollowerCount(channelID, false); err != nil {
+	if err := db.UpdateFollowerCount(channelID, userID, false); err != nil {
 		return err
 	}
 
@@ -399,71 +459,74 @@ func (db *Database) GetTwitterInfoByType(type_ int, limit, offset int) ([]models
 }
 
 // GetTwitterInfoByWatchlist gets Twitter info based on watchlist conditions
-func (db *Database) GetTwitterInfoByWatchlist(conditions []string, contentType, limit, offset int) ([]models.TwitterInfo, error) {
-	var twitterInfos []models.TwitterInfo
-	if len(conditions) == 0 {
-		return twitterInfos, nil
+func (db *Database) GetTwitterInfoByWatchlist(conditions []string, contentType int, limit, offset int) ([]*models.TwitterInfo, error) {
+	query := `
+		SELECT id, twitterId, content, COALESCE(chainId, ''), COALESCE(address, ''), createTime, type
+		FROM twitter_info
+		WHERE type = ?
+	`
+
+	if len(conditions) > 0 {
+		query += " AND (" + strings.Join(conditions, " OR ") + ")"
 	}
 
-	query := "SELECT * FROM twitter_info WHERE (" + strings.Join(conditions, " OR ") + ") AND type = ? ORDER BY createTime DESC"
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
-	}
-	log.Print(query)
-	rows, err := db.db.Query(query, contentType)
+	query += " ORDER BY createTime DESC LIMIT ? OFFSET ?"
+
+	rows, err := db.db.Query(query, contentType, limit, offset)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query Twitter info: %v", err)
 	}
 	defer rows.Close()
 
+	var twitterInfos []*models.TwitterInfo
 	for rows.Next() {
 		var info models.TwitterInfo
-		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
-		if err != nil {
-			return nil, err
+		if err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type); err != nil {
+			return nil, fmt.Errorf("failed to scan Twitter info: %v", err)
 		}
-		twitterInfos = append(twitterInfos, info)
+		twitterInfos = append(twitterInfos, &info)
 	}
 
 	return twitterInfos, nil
 }
 
-// GetTwitterInfoByProfileAndFollow gets Twitter info for profile updates and follows
-func (db *Database) GetTwitterInfoByProfileAndFollow(twitterIds []string, contentType, limit, offset int) ([]models.TwitterInfo, error) {
-	var twitterInfos []models.TwitterInfo
-
+// GetTwitterInfoByProfileAndFollow gets Twitter info based on profile and follow conditions
+func (db *Database) GetTwitterInfoByProfileAndFollow(twitterIds []string, contentType int, limit, offset int) ([]*models.TwitterInfo, error) {
 	if len(twitterIds) == 0 {
-		return twitterInfos, nil
+		return nil, nil
 	}
 
-	query := "SELECT * FROM twitter_info WHERE twitterId IN ("
 	placeholders := make([]string, len(twitterIds))
-	args := make([]interface{}, len(twitterIds))
-	for i, id := range twitterIds {
+	args := make([]interface{}, len(twitterIds)+3)
+	for i := range twitterIds {
 		placeholders[i] = "?"
-		args[i] = id
+		args[i] = twitterIds[i]
 	}
-	query += strings.Join(placeholders, ",") + ")"
+	args[len(twitterIds)] = contentType
+	args[len(twitterIds)+1] = limit
+	args[len(twitterIds)+2] = offset
 
-	query += " AND type = ? ORDER BY createTime DESC"
-	args = append(args, contentType)
-	if limit > 0 {
-		query += fmt.Sprintf(" LIMIT %d OFFSET %d", limit, offset)
-	}
+	query := fmt.Sprintf(`
+		SELECT id, twitter_id, content, COALESCE(chain_id, ''), COALESCE(address, ''), create_time, type
+		FROM twitter_info
+		WHERE twitter_id IN (%s) AND type = ?
+		ORDER BY create_time DESC
+		LIMIT ? OFFSET ?
+	`, strings.Join(placeholders, ","))
 
 	rows, err := db.db.Query(query, args...)
 	if err != nil {
-		return nil, err
+		return nil, fmt.Errorf("failed to query Twitter info: %v", err)
 	}
 	defer rows.Close()
 
+	var twitterInfos []*models.TwitterInfo
 	for rows.Next() {
 		var info models.TwitterInfo
-		err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type)
-		if err != nil {
-			return nil, err
+		if err := rows.Scan(&info.ID, &info.TwitterId, &info.Content, &info.ChainId, &info.Address, &info.CreateTime, &info.Type); err != nil {
+			return nil, fmt.Errorf("failed to scan Twitter info: %v", err)
 		}
-		twitterInfos = append(twitterInfos, info)
+		twitterInfos = append(twitterInfos, &info)
 	}
 
 	return twitterInfos, nil
@@ -494,7 +557,7 @@ func (db *Database) GetFollowedChannels(userID int) ([]*models.Follow, error) {
 func (db *Database) GetChannelByID(channelID string) (*models.Channel, error) {
 	var channel models.Channel
 	row := db.db.QueryRow("SELECT * FROM channels WHERE id = ?", channelID)
-
+	var watchlistStr, eventlistStr, recentFollowersStr string
 	err := row.Scan(
 		&channel.ID,
 		&channel.OwnerID,
@@ -508,11 +571,27 @@ func (db *Database) GetChannelByID(channelID string) (*models.Channel, error) {
 		&channel.HotExpireAt,
 		&channel.CreatedAt,
 		&channel.UpdatedAt,
-		&channel.Watchlist,
-		&channel.Eventlist,
+		&watchlistStr,
+		&eventlistStr,
 		&channel.FollowerCount,
-		&channel.RecentFollowers,
+		&recentFollowersStr,
 	)
+
+	// Unmarshal Watchlist
+	if err := json.Unmarshal([]byte(watchlistStr), &channel.Watchlist); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal watchlist: %v", err)
+	}
+
+	// Unmarshal Eventlist
+	if err := json.Unmarshal([]byte(eventlistStr), &channel.Eventlist); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal eventlist: %v", err)
+	}
+
+	// Unmarshal RecentFollowers
+	if err := json.Unmarshal([]byte(recentFollowersStr), &channel.RecentFollowers); err != nil {
+		return nil, fmt.Errorf("failed to unmarshal recentFollowers: %v", err)
+	}
+
 	if err != nil {
 		return nil, err
 	}
@@ -535,6 +614,7 @@ func (db *Database) GetAllChannels(limit, offset int) ([]*models.Channel, error)
 
 	for rows.Next() {
 		var channel models.Channel
+		var watchlistStr, eventlistStr, recentFollowersStr string
 		err := rows.Scan(
 			&channel.ID,
 			&channel.OwnerID,
@@ -548,14 +628,31 @@ func (db *Database) GetAllChannels(limit, offset int) ([]*models.Channel, error)
 			&channel.HotExpireAt,
 			&channel.CreatedAt,
 			&channel.UpdatedAt,
-			&channel.Watchlist,
-			&channel.Eventlist,
+			&watchlistStr,
+			&eventlistStr,
 			&channel.FollowerCount,
-			&channel.RecentFollowers,
+			&recentFollowersStr,
 		)
 		if err != nil {
+			utils.LogError("Error scanning channel", "error", err)
 			return nil, err
 		}
+
+		// Unmarshal Watchlist
+		if err := json.Unmarshal([]byte(watchlistStr), &channel.Watchlist); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal watchlist: %v", err)
+		}
+
+		// Unmarshal Eventlist
+		if err := json.Unmarshal([]byte(eventlistStr), &channel.Eventlist); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal eventlist: %v", err)
+		}
+
+		// Unmarshal RecentFollowers
+		if err := json.Unmarshal([]byte(recentFollowersStr), &channel.RecentFollowers); err != nil {
+			return nil, fmt.Errorf("failed to unmarshal recentFollowers: %v", err)
+		}
+
 		channels = append(channels, &channel)
 	}
 
@@ -632,4 +729,36 @@ func (db *Database) GetChannelByIDs(channelIDs []string) ([]*models.Channel, err
 	}
 
 	return channels, nil
+}
+
+// GetRecentFollowers gets the most recent followers for a channel
+func (db *Database) GetRecentFollowers(channelID string, limit int) ([]int, error) {
+	if limit <= 0 {
+		limit = 100 // Default to 100 if not specified
+	}
+
+	query := `
+		SELECT userId 
+		FROM follows 
+		WHERE channelId = ? 
+		ORDER BY createdAt DESC 
+		LIMIT ?
+	`
+
+	rows, err := db.db.Query(query, channelID, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query recent followers: %v", err)
+	}
+	defer rows.Close()
+
+	var followers []int
+	for rows.Next() {
+		var userID int
+		if err := rows.Scan(&userID); err != nil {
+			return nil, fmt.Errorf("failed to scan follower: %v", err)
+		}
+		followers = append(followers, userID)
+	}
+
+	return followers, nil
 }

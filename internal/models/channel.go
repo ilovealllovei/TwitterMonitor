@@ -47,6 +47,10 @@ type Channel struct {
 type Watchlist struct {
 	TwitterName   string `json:"twitterName"`
 	TwitterId     string `json:"twitterId"`
+	TwitterVerify string `json:"twitterVerify"`
+	TwitterRisk   string `json:"twitterRisk"`
+	TwitterAvatar string `json:"twitterAvatar"`
+
 	Tweets        bool   `json:"tweets"`
 	ProfileUpdate bool   `json:"profileUpdate"`
 	Follows       bool   `json:"follows"`
@@ -111,7 +115,7 @@ type CreateOrUpdateChannelRequest struct {
 	Name        string      `json:"name" binding:"required"`
 	Avatar      string      `json:"avatar" binding:"required"`
 	Description string      `json:"description" binding:"required"`
-	TwitterLink string      `json:"twitter" binding:"required"`
+	ChatLink    string      `json:"chatLink" binding:"required"`
 	IsPublic    bool        `json:"isPublic"`
 	Watchlist   []Watchlist `json:"watchlist" binding:"required"`
 	Eventlist   []EventList `json:"eventlist" binding:"required"`
