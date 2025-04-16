@@ -240,7 +240,7 @@ func (h *ChannelHandler) DeleteChannel(c *gin.Context) {
 
 	if channelToDelete == nil {
 		c.JSON(http.StatusNotFound, gin.H{
-			"code":    404,
+			"code":    403,
 			"message": "Channel not found or you don't have permission to delete it",
 		})
 		return
@@ -308,7 +308,7 @@ func (h *ChannelHandler) FollowChannel(c *gin.Context) {
 	}
 
 	// Check if the channel exists
-	channels, err := h.db.GetChannelsByOwnerID(req.UserID)
+	channels, err := h.db.GetChannelsByID(req.ID)
 	if err != nil {
 		utils.LogError("Error getting channels: %v", err)
 		c.JSON(http.StatusInternalServerError, gin.H{
@@ -318,6 +318,7 @@ func (h *ChannelHandler) FollowChannel(c *gin.Context) {
 		return
 	}
 
+	log.Printf("Channels: %+v", channels)
 	// Check if channel exists
 	channelExists := false
 	for _, channel := range channels {

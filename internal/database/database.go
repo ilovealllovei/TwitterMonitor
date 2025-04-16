@@ -254,33 +254,35 @@ func (db *Database) UpdateFollowerCount(channelID string, userID int, increment 
 	query := fmt.Sprintf("UPDATE channels SET followerCount = CAST(followerCount AS SIGNED) %s 1 WHERE id = ?", operator)
 	_, err = tx.Exec(query, channelID)
 	if err != nil {
+		utils.LogError("Error updating follower count: %v", err)
 		return fmt.Errorf("failed to update follower count: %v", err)
 	}
 
+	// Get current recentFollowersStr
+	var currentFollowersStr string
+	err = tx.QueryRow("SELECT recentFollowers FROM channels WHERE id = ?", channelID).Scan(&currentFollowersStr)
+	if err != nil {
+		utils.LogError("Error updating follower count: %v", err)
+		return fmt.Errorf("failed to get current followers: %v", err)
+	}
+
+	// Parse current followers
+	var currentFollowers []int
+	if currentFollowersStr != "" {
+		if err := json.Unmarshal([]byte(currentFollowersStr), &currentFollowers); err != nil {
+			return fmt.Errorf("failed to parse current followers: %v", err)
+		}
+	}
+
+	// Add new follower and ensure uniqueness
+	exists := false
+	for _, id := range currentFollowers {
+		if id == userID {
+			exists = true
+			break
+		}
+	}
 	if increment {
-		// Get current recentFollowersStr
-		var currentFollowersStr string
-		err = tx.QueryRow("SELECT recentFollowersStr FROM channels WHERE id = ?", channelID).Scan(&currentFollowersStr)
-		if err != nil {
-			return fmt.Errorf("failed to get current followers: %v", err)
-		}
-
-		// Parse current followers
-		var currentFollowers []int
-		if currentFollowersStr != "" {
-			if err := json.Unmarshal([]byte(currentFollowersStr), &currentFollowers); err != nil {
-				return fmt.Errorf("failed to parse current followers: %v", err)
-			}
-		}
-
-		// Add new follower and ensure uniqueness
-		exists := false
-		for _, id := range currentFollowers {
-			if id == userID {
-				exists = true
-				break
-			}
-		}
 		if !exists {
 			// Add new follower at the beginning
 			currentFollowers = append([]int{userID}, currentFollowers...)
@@ -289,18 +291,28 @@ func (db *Database) UpdateFollowerCount(channelID string, userID int, increment 
 				currentFollowers = currentFollowers[:50]
 			}
 		}
-
-		// Convert back to JSON
-		newFollowersStr, err := json.Marshal(currentFollowers)
-		if err != nil {
-			return fmt.Errorf("failed to marshal followers: %v", err)
+	} else {
+		if exists {
+			// Remove follower
+			for i, id := range currentFollowers {
+				if id == userID {
+					currentFollowers = append(currentFollowers[:i], currentFollowers[i+1:]...)
+					break
+				}
+			}
 		}
+	}
 
-		// Update recentFollowersStr
-		_, err = tx.Exec("UPDATE channels SET recentFollowersStr = ? WHERE id = ?", string(newFollowersStr), channelID)
-		if err != nil {
-			return fmt.Errorf("failed to update recent followers: %v", err)
-		}
+	// Convert back to JSON
+	newFollowersStr, err := json.Marshal(currentFollowers)
+	if err != nil {
+		return fmt.Errorf("failed to marshal followers: %v", err)
+	}
+
+	// Update recentFollowersStr
+	_, err = tx.Exec("UPDATE channels SET recentFollowers = ? WHERE id = ?", string(newFollowersStr), channelID)
+	if err != nil {
+		return fmt.Errorf("failed to update recent followers: %v", err)
 	}
 
 	// Commit transaction
@@ -336,6 +348,7 @@ func (db *Database) FollowChannel(follow *models.Follow) error {
 
 	// Update follower count
 	if err := db.UpdateFollowerCount(follow.ChannelID, follow.UserID, true); err != nil {
+		utils.LogError("failed to update follower count: %v", err)
 		return err
 	}
 
